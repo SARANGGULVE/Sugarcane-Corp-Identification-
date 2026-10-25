@@ -1,0 +1,747 @@
+// === SUGARCANE DETECTION USING SUGARCANE NIR INDEX === //
+
+// === 1. LOAD SHAPEFILE (AOI) ===
+var aoi = ee.FeatureCollection(table3);
+var studyArea = aoi.geometry();
+Map.centerObject(studyArea, 12);
+Map.addLayer(aoi, {color: 'yellow'}, 'Study Area');
+
+// === 2. TIME RANGE ===
+var startDate = '2025-05-01';
+var endDate = '2025-05-31';
+
+// === 3. LOAD ESA WORLDCOVER FOR CROPLAND MASK ===
+var worldcover = ee.ImageCollection('ESA/WorldCover/v200')
+  .first()
+  .clip(studyArea);
+var croplandMask = worldcover.eq(40);
+Map.addLayer(croplandMask.selfMask(), {palette: ['orange']}, 'Cropland Areas', false);
+
+// === 4. SENTINEL-2 PROCESSING ===
+function maskS2SCL(image) {
+  var scl = image.select('SCL');
+  var mask = scl.neq(3).and(scl.neq(8)).and(scl.neq(9)).and(scl.neq(10)).and(scl.neq(1));
+  return image.updateMask(mask).divide(10000);
+}
+
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR')
+  .filterBounds(studyArea)
+  .filterDate(startDate, endDate)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 15))
+  .map(maskS2SCL);
+
+var composite = s2.median().clip(studyArea);
+
+// === 5. SUGARCANE NIR INDEX CALCULATION ===
+function calculateSugarcaneNIRIndex(image) {
+  // Primary Sugarcane NIR Index - optimized for sugarcane detection
+  var sugarcaneNIR = image.expression(
+    '(NIR + B8A - B5 - B6 + 0.15 * (NIR - SWIR)) / (NIR + B8A + B5 + B6 + 0.15)',
+    {
+      'NIR': image.select('B8'),
+      'B8A': image.select('B8A'),
+      'B5': image.select('B5'),
+      'B6': image.select('B6'),
+      'SWIR': image.select('B11')
+    }
+  ).rename('SugarcaneNIR');
+
+  // Enhanced Sugarcane NIR Index with additional weighting
+  var sugarcaneNIREnhanced = image.expression(
+    '((NIR * 1.2) + (B8A * 0.8) - (B5 * 0.6) - (B6 * 0.4) + (NIR - SWIR) * 0.2) / ' +
+    '((NIR * 1.2) + (B8A * 0.8) + (B5 * 0.6) + (B6 * 0.4) + 1)',
+    {
+      'NIR': image.select('B8'),
+      'B8A': image.select('B8A'),
+      'B5': image.select('B5'),
+      'B6': image.select('B6'),
+      'SWIR': image.select('B11')
+    }
+  ).rename('SugarcaneNIR_Enhanced');
+
+  // Normalized Sugarcane NIR Index
+  var sugarcaneNIRNorm = image.expression(
+    '(NIR - 0.5 * (B5 + B6)) / (NIR + 0.5 * (B5 + B6))',
+    {
+      'NIR': image.select('B8'),
+      'B5': image.select('B5'),
+      'B6': image.select('B6')
+    }
+  ).rename('SugarcaneNIR_Norm');
+
+  // Additional supporting indices
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  var nirRatio = image.select('B8').divide(image.select('B4')).rename('NIR_RED_RATIO');
+  var savi = image.expression(
+    '1.5 * (NIR - RED) / (NIR + RED + 0.5)',
+    {
+      'NIR': image.select('B8'),
+      'RED': image.select('B4')
+    }
+  ).rename('SAVI');
+
+  // NDMI (Normalized Difference Moisture Index)
+  var ndmi = image.normalizedDifference(['B8', 'B11']).rename('NDMI');
+
+  return image.addBands([
+    sugarcaneNIR,
+    sugarcaneNIREnhanced,
+    sugarcaneNIRNorm,
+    ndvi,
+    nirRatio,
+    savi,
+    ndmi
+  ]);
+}
+
+var compositeWithNIR = calculateSugarcaneNIRIndex(composite);
+
+// === 6. SUGARCANE NIR INDEX ANALYSIS ===
+var sugarcaneNIR = compositeWithNIR.select('SugarcaneNIR');
+var sugarcaneNIREnhanced = compositeWithNIR.select('SugarcaneNIR_Enhanced');
+var sugarcaneNIRNorm = compositeWithNIR.select('SugarcaneNIR_Norm');
+var ndvi = compositeWithNIR.select('NDVI');
+var savi = compositeWithNIR.select('SAVI');
+var ndmi = compositeWithNIR.select('NDMI');
+
+// Apply cropland mask to NIR indices
+var croplandSugarcaneNIR = sugarcaneNIR.updateMask(croplandMask);
+var croplandSugarcaneNIREnhanced = sugarcaneNIREnhanced.updateMask(croplandMask);
+var croplandNDVI = ndvi.updateMask(croplandMask);
+var croplandNDMI = ndmi.updateMask(croplandMask);
+
+// === 7. ADAPTIVE THRESHOLD CALCULATION ===
+print('=== ANALYZING SUGARCANE NIR INDEX DISTRIBUTION ===');
+
+// Calculate statistics for Sugarcane NIR Index
+var nirIndexStats = croplandSugarcaneNIR.reduceRegion({
+  reducer: ee.Reducer.percentile([50, 60, 70, 75, 80, 85, 90, 95]).combine({
+    reducer2: ee.Reducer.mean().combine({
+      reducer2: ee.Reducer.stdDev(),
+      sharedInputs: true
+    }),
+    sharedInputs: true
+  }),
+  geometry: studyArea,
+  scale: 20,
+  maxPixels: 1e7
+});
+print('Sugarcane NIR Index Statistics:', nirIndexStats);
+
+// Calculate statistics for Enhanced Sugarcane NIR Index
+var nirIndexEnhancedStats = croplandSugarcaneNIREnhanced.reduceRegion({
+  reducer: ee.Reducer.percentile([50, 60, 70, 75, 80, 85, 90, 95]).combine({
+    reducer2: ee.Reducer.mean().combine({
+      reducer2: ee.Reducer.stdDev(),
+      sharedInputs: true
+    }),
+    sharedInputs: true
+  }),
+  geometry: studyArea,
+  scale: 20,
+  maxPixels: 1e7
+});
+print('Enhanced Sugarcane NIR Index Statistics:', nirIndexEnhancedStats);
+
+// Extract adaptive thresholds
+var nirMean = ee.Number(nirIndexStats.get('SugarcaneNIR_mean'));
+var nirStdDev = ee.Number(nirIndexStats.get('SugarcaneNIR_stdDev'));
+var nirP75 = ee.Number(nirIndexStats.get('SugarcaneNIR_p75'));
+var nirP80 = ee.Number(nirIndexStats.get('SugarcaneNIR_p80'));
+var nirP85 = ee.Number(nirIndexStats.get('SugarcaneNIR_p85'));
+
+// Enhanced thresholds
+var nirEnhancedP75 = ee.Number(nirIndexEnhancedStats.get('SugarcaneNIR_Enhanced_p75'));
+var nirEnhancedP80 = ee.Number(nirIndexEnhancedStats.get('SugarcaneNIR_Enhanced_p80'));
+
+// NDVI supporting threshold
+var ndviStats = croplandNDVI.reduceRegion({
+  reducer: ee.Reducer.percentile([70, 80]),
+  geometry: studyArea,
+  scale: 20,
+  maxPixels: 1e7
+});
+var ndviP70 = ee.Number(ndviStats.get('NDVI_p70'));
+
+// NDMI supporting threshold
+var ndmiStats = croplandNDMI.reduceRegion({
+  reducer: ee.Reducer.percentile([70, 80]),
+  geometry: studyArea,
+  scale: 20,
+  maxPixels: 1e7
+});
+var ndmiP70 = ee.Number(ndmiStats.get('NDMI_p70'));
+
+print('Adaptive Thresholds:');
+print('  - Sugarcane NIR Index P75:', nirP75);
+print('  - Sugarcane NIR Index P80:', nirP80);
+print('  - Sugarcane NIR Index P85:', nirP85);
+print('  - Enhanced NIR Index P80:', nirEnhancedP80);
+print('  - NDVI P70 (support):', ndviP70);
+print('  - NDMI P70 (support):', ndmiP70);
+
+// === 8. SUGARCANE DETECTION USING NIR INDEX ===
+// Method 1: Primary Sugarcane NIR Index based detection
+var sugarcanePrimary = sugarcaneNIR.gte(nirP80)
+  .and(ndvi.gte(ndviP70))
+  .and(ndmi.gte(ndmiP70))
+  .and(croplandMask)
+  .rename('Sugarcane_Primary');
+
+// Method 2: Enhanced Sugarcane NIR Index based detection
+var sugarcaneEnhanced = sugarcaneNIREnhanced.gte(nirEnhancedP80)
+  .and(ndvi.gte(ndviP70))
+  .and(croplandMask)
+  .rename('Sugarcane_Enhanced');
+
+// Method 3: Combined approach - more conservative
+var sugarcaneCombined = sugarcaneNIR.gte(nirP75)
+  .and(sugarcaneNIREnhanced.gte(nirEnhancedP75))
+  .and(ndvi.gte(ndviP70))
+  .and(croplandMask)
+  .rename('Sugarcane_Combined');
+
+// Method 4: High confidence detection
+var sugarcaneHighConf = sugarcaneNIR.gte(nirP85)
+  .and(sugarcaneNIREnhanced.gte(nirEnhancedP80))
+  .and(ndvi.gte(0.7))
+  .and(savi.gte(0.5))
+  .and(croplandMask)
+  .rename('Sugarcane_HighConf');
+
+// === 9. POST-PROCESSING ===
+// Apply morphological operations to reduce noise
+var kernel = ee.Kernel.circle({radius: 1});
+var sugarcanePrimarySmooth = sugarcanePrimary.focal_mode({kernel: kernel, iterations: 2});
+var sugarcaneEnhancedSmooth = sugarcaneEnhanced.focal_mode({kernel: kernel, iterations: 2});
+var sugarcaneCombinedSmooth = sugarcaneCombined.focal_mode({kernel: kernel, iterations: 2});
+
+// Additional smoothing for high confidence areas
+var kernelLarge = ee.Kernel.circle({radius: 2});
+var sugarcaneHighConfSmooth = sugarcaneHighConf.focal_mode({kernel: kernelLarge, iterations: 1});
+
+// Mask NDMI to only show sugarcane-detected areas (using primary method)
+var ndmiSugarcane = ndmi.updateMask(sugarcanePrimarySmooth);
+
+// Visualization parameters for NDMI (adjust palette as needed)
+var ndmiVis = {
+  min: -1,
+  max: 1,
+  palette: ['brown', 'yellow', 'cyan', 'blue', 'darkblue']
+};
+
+// Add NDMI overlay for sugarcane areas to the map
+Map.addLayer(ndmiSugarcane, ndmiVis, 'NDMI over Sugarcane Area');
+
+// === 10. AREA CALCULATIONS ===
+var pixelArea = ee.Image.pixelArea();
+
+// Modified function to return only the area value without printing method name
+function calculateAreaOnly(image) {
+  var area = image.eq(1)
+    .multiply(pixelArea)
+    .reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: studyArea,
+      scale: 10,
+      maxPixels: 1e9
+    });
+  return ee.Number(area.values().get(0)).divide(10000);
+}
+
+// Calculate areas - only the primary method for final sugarcane area
+var areaPrimary = calculateAreaOnly(sugarcanePrimarySmooth);
+var areaEnhanced = calculateAreaOnly(sugarcaneEnhancedSmooth);
+var areaCombined = calculateAreaOnly(sugarcaneCombinedSmooth);
+var areaHighConf = calculateAreaOnly(sugarcaneHighConfSmooth);
+
+// Print only the single sugarcane area value
+print('Sugarcane Area (hectares):', areaPrimary);
+
+// Total cropland area for reference
+var croplandArea = croplandMask
+  .multiply(pixelArea)
+  .reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: studyArea,
+    scale: 10,
+    maxPixels: 1e9
+  });
+var totalCroplandHa = ee.Number(croplandArea.values().get(0)).divide(10000);
+print('Total Cropland Area (hectares):', totalCroplandHa);
+
+// Print only the single percentage value for sugarcane
+var sugarcanePercentage = areaPrimary.divide(totalCroplandHa).multiply(100);
+print('Sugarcane as % of Cropland:', sugarcanePercentage);
+
+// === 11. VISUALIZATION ===
+// Sugarcane NIR Index visualization
+Map.addLayer(sugarcaneNIR, {
+  min: -0.2,
+  max: 0.5,
+  palette: ['red', 'orange', 'yellow', 'lightgreen', 'green', 'darkgreen']
+}, 'Sugarcane NIR Index');
+
+Map.addLayer(sugarcaneNIREnhanced, {
+  min: -0.2,
+  max: 0.5,
+  palette: ['red', 'orange', 'yellow', 'lightgreen', 'green', 'darkgreen']
+}, 'Enhanced Sugarcane NIR Index', false);
+
+// Detection results
+Map.addLayer(sugarcanePrimarySmooth.selfMask(), {palette: ['lime']}, 'Sugarcane (Primary NIR)');
+Map.addLayer(sugarcaneEnhancedSmooth.selfMask(), {palette: ['cyan']}, 'Sugarcane (Enhanced NIR)', false);
+Map.addLayer(sugarcaneCombinedSmooth.selfMask(), {palette: ['yellow']}, 'Sugarcane (Combined NIR)', false);
+Map.addLayer(sugarcaneHighConfSmooth.selfMask(), {palette: ['red']}, 'Sugarcane (High Confidence)', false);
+
+// Support layers
+Map.addLayer(composite.select(['B4', 'B3', 'B2']), {min: 0, max: 0.3}, 'RGB Composite');
+Map.addLayer(ndvi, {min: 0, max: 1, palette: ['white', 'green']}, 'NDVI', false);
+Map.addLayer(savi, {min: 0, max: 1, palette: ['brown', 'yellow', 'green']}, 'SAVI', false);
+Map.addLayer(ndmi, {min: -1, max: 1, palette: ['brown', 'yellow', 'blue']}, 'NDMI', false);
+
+// === 12. THRESHOLD ANALYSIS ===
+print('=== THRESHOLD SENSITIVITY ANALYSIS ===');
+
+// Test different thresholds
+var thresholds = [0.1, 0.15, 0.2, 0.25, 0.3];
+var thresholdCollection = ee.FeatureCollection(thresholds.map(function(threshold) {
+  var mask = sugarcaneNIR.gte(threshold)
+    .and(ndvi.gte(0.6))
+    .and(croplandMask);
+  
+  var area = mask.eq(1)
+    .multiply(pixelArea)
+    .reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: studyArea,
+      scale: 20,
+      maxPixels: 1e8
+    });
+  
+  var areaHa = ee.Number(area.values().get(0)).divide(10000);
+  
+  return ee.Feature(null, {
+    'threshold': threshold,
+    'area_ha': areaHa,
+    'percentage': areaHa.divide(totalCroplandHa).multiply(100)
+  });
+}));
+
+print('Threshold Analysis (NIR Index >= threshold, NDVI >= 0.6):');
+print(thresholdCollection);
+
+// === 13. CONFIDENCE MAPPING ===
+var confidenceMap = ee.Image(0)
+  .where(sugarcanePrimarySmooth.eq(1), 1)
+  .where(sugarcaneEnhancedSmooth.eq(1), 2)
+  .where(sugarcaneCombinedSmooth.eq(1), 3)
+  .where(sugarcaneHighConfSmooth.eq(1), 4)
+  .rename('Confidence_Level');
+
+Map.addLayer(confidenceMap.selfMask(), {
+  min: 1,
+  max: 4,
+  palette: ['lightgreen', 'yellow', 'orange', 'red']
+}, 'Sugarcane Confidence Levels', false);
+
+// === 14. STYLED EXPORT RESULTS ===
+
+// Create a grayscale background from the study area
+var grayBackground = ee.Image(128).byte() // Medium gray value (128)
+    .clip(studyArea)
+    .rename('gray');
+
+// Create RGB channels for the styled visualization
+var redChannel = grayBackground;
+var greenChannel = grayBackground;
+var blueChannel = grayBackground;
+
+// Create sugarcane mask (where sugarcane is detected)
+var sugarcaneMask = sugarcanePrimarySmooth.eq(1);
+
+// Overlay bright green dots for sugarcane locations
+// Using bright green (0, 255, 0) for sugarcane pixels
+var styledRed = redChannel.where(sugarcaneMask, 0);      // Red = 0 for sugarcane
+var styledGreen = greenChannel.where(sugarcaneMask, 255); // Green = 255 for sugarcane  
+var styledBlue = blueChannel.where(sugarcaneMask, 0);     // Blue = 0 for sugarcane
+
+// Combine RGB channels
+var styledVisualization = ee.Image.rgb(styledRed, styledGreen, styledBlue);
+
+// Export the styled visualization (MAIN EXPORT - matches your reference image)
+Export.image.toDrive({
+  image: styledVisualization,
+  description: 'sugarcane_styled_gray_background_green_dots',
+  scale: 10,
+  region: studyArea,
+  maxPixels: 1e9,
+  fileFormat: 'GeoTIFF'
+});
+
+// Alternative version with darker gray background for better contrast
+var darkGrayBackground = ee.Image(80).byte() // Darker gray (80)
+    .clip(studyArea);
+
+var darkStyledRed = darkGrayBackground.where(sugarcaneMask, 0);
+var darkStyledGreen = darkGrayBackground.where(sugarcaneMask, 255);
+var darkStyledBlue = darkGrayBackground.where(sugarcaneMask, 0);
+
+var darkStyledVisualization = ee.Image.rgb(darkStyledRed, darkStyledGreen, darkStyledBlue);
+
+Export.image.toDrive({
+  image: darkStyledVisualization,
+  description: 'sugarcane_styled_dark_gray_background_green_dots',
+  scale: 10,
+  region: studyArea,
+  maxPixels: 1e9,
+  fileFormat: 'GeoTIFF'
+});
+
+// Version with actual satellite image as background (more realistic)
+var satelliteBackground = composite.select(['B4', 'B3', 'B2']) // RGB composite
+    .multiply(255).byte() // Convert to 8-bit
+    .clip(studyArea);
+
+// Create bright green overlay for sugarcane on satellite background
+var satRed = satelliteBackground.select('B4').where(sugarcaneMask, 0);
+var satGreen = satelliteBackground.select('B3').where(sugarcaneMask, 255);
+var satBlue = satelliteBackground.select('B2').where(sugarcaneMask, 0);
+
+var satelliteStyled = ee.Image.rgb(satRed, satGreen, satBlue);
+
+Export.image.toDrive({
+  image: satelliteStyled,
+  description: 'sugarcane_satellite_background_green_overlay',
+  scale: 10,
+  region: studyArea,
+  maxPixels: 1e9,
+  fileFormat: 'GeoTIFF'
+});
+
+// High-contrast version with white background and bright green dots
+var whiteBackground = ee.Image(255).byte() // White background
+    .clip(studyArea);
+
+var whiteStyledRed = whiteBackground.where(sugarcaneMask, 0);
+var whiteStyledGreen = whiteBackground.where(sugarcaneMask, 255);
+var whiteStyledBlue = whiteBackground.where(sugarcaneMask, 0);
+
+var whiteStyledVisualization = ee.Image.rgb(whiteStyledRed, whiteStyledGreen, whiteStyledBlue);
+
+Export.image.toDrive({
+  image: whiteStyledVisualization,
+  description: 'sugarcane_white_background_green_dots',
+  scale: 10,
+  region: studyArea,
+  maxPixels: 1e9,
+  fileFormat: 'GeoTIFF'
+});
+
+// Export confidence levels with different green intensities
+var confidenceStyled = ee.Image(128).byte() // Gray background
+    .clip(studyArea)
+    .rename('background');
+
+// Create different shades of green for different confidence levels
+var confRed = confidenceStyled.where(sugarcanePrimarySmooth.eq(1), 0)
+                            .where(sugarcaneHighConfSmooth.eq(1), 0);
+
+var confGreen = confidenceStyled.where(sugarcanePrimarySmooth.eq(1), 180)  // Light green for primary
+                              .where(sugarcaneHighConfSmooth.eq(1), 255);  // Bright green for high confidence
+
+var confBlue = confidenceStyled.where(sugarcanePrimarySmooth.eq(1), 0)
+                             .where(sugarcaneHighConfSmooth.eq(1), 0);
+
+var confidenceVisualization = ee.Image.rgb(confRed, confGreen, confBlue);
+
+Export.image.toDrive({
+  image: confidenceVisualization,
+  description: 'sugarcane_confidence_levels_styled',
+  scale: 10,
+  region: studyArea,
+  maxPixels: 1e9,
+  fileFormat: 'GeoTIFF'
+});
+
+// Export the Sugarcane NIR Index
+Export.image.toDrive({
+  image: sugarcaneNIR,
+  description: 'sugarcane_NIR_index_values',
+  scale: 10,
+  region: studyArea,
+  maxPixels: 1e9
+});
+
+// Export combined results
+var combinedResults = sugarcanePrimarySmooth.rename('Primary')
+  .addBands(sugarcaneEnhancedSmooth.rename('Enhanced'))
+  .addBands(sugarcaneCombinedSmooth.rename('Combined'))
+  .addBands(sugarcaneHighConfSmooth.rename('HighConf'))
+  .addBands(confidenceMap);
+
+Export.image.toDrive({
+  image: combinedResults,
+  description: 'sugarcane_all_methods_comparison',
+  scale: 10,
+  region: studyArea,
+  maxPixels: 1e9
+});
+
+// Export statistics as CSV
+var statsTable = ee.FeatureCollection([
+  ee.Feature(null, {
+    'Method': 'Primary_NIR',
+    'Area_ha': areaPrimary,
+    'Percentage': areaPrimary.divide(totalCroplandHa).multiply(100)
+  }),
+  ee.Feature(null, {
+    'Method': 'Enhanced_NIR',
+    'Area_ha': areaEnhanced,
+    'Percentage': areaEnhanced.divide(totalCroplandHa).multiply(100)
+  }),
+  ee.Feature(null, {
+    'Method': 'Combined_NIR',
+    'Area_ha': areaCombined,
+    'Percentage': areaCombined.divide(totalCroplandHa).multiply(100)
+  }),
+  ee.Feature(null, {
+    'Method': 'High_Confidence',
+    'Area_ha': areaHighConf,
+    'Percentage': areaHighConf.divide(totalCroplandHa).multiply(100)
+  })
+]);
+
+Export.table.toDrive({
+  collection: statsTable,
+  description: 'sugarcane_detection_statistics',
+  fileFormat: 'CSV'
+});
+
+// Optional: Create a point-based visualization for very sparse representation
+var sugarcanePoints = sugarcanePrimarySmooth.eq(1).selfMask()
+    .reduceToVectors({
+      geometry: studyArea,
+      scale: 50, // Larger scale for point representation
+      maxPixels: 1e8
+    });
+
+// Export the points as shapefile
+Export.table.toDrive({
+  collection: sugarcanePoints,
+  description: 'sugarcane_points_shapefile',
+  fileFormat: 'SHP'
+});
+
+// Add the styled visualizations to the map for preview
+Map.addLayer(styledVisualization, {}, 'Styled Sugarcane (Gray + Green)', false);
+Map.addLayer(darkStyledVisualization, {}, 'Styled Sugarcane (Dark Gray + Green)', false);
+Map.addLayer(satelliteStyled, {}, 'Sugarcane on Satellite Background', false);
+
+// === 15. CREATE LEGEND ===
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-left',
+    padding: '8px 15px',
+    backgroundColor: 'rgba(255, 255, 255, 0.95)'
+  }
+});
+
+legend.add(ui.Label({
+  value: 'Sugarcane NIR Index Detection',
+  style: {fontWeight: 'bold', fontSize: '16px', margin: '0 0 8px 0'}
+}));
+
+var legendItems = [
+  {color: 'lime', label: 'Sugarcane (Primary NIR Index)'},
+  {color: 'red', label: 'High Confidence Sugarcane'},
+  {color: 'darkgreen', label: 'High Sugarcane NIR Index (>P85)'},
+  {color: 'lightgreen', label: 'Medium Sugarcane NIR Index (P75-P85)'},
+  {color: 'yellow', label: 'Low Sugarcane NIR Index (P60-P75)'},
+  {color: 'orange', label: 'Cropland Areas'},
+  {color: 'white', label: 'Non-cropland/Low vegetation'}
+];
+
+legendItems.forEach(function(item) {
+  var colorBox = ui.Label({
+    style: {
+      backgroundColor: item.color,
+      padding: '8px',
+      margin: '0 8px 0 0'
+    }
+  });
+  var description = ui.Label({
+    value: item.label,
+    style: {margin: '0 0 4px 6px'}
+  });
+  legend.add(
+    ui.Panel({
+      widgets: [colorBox, description],
+      layout: ui.Panel.Layout.Flow('horizontal')
+    })
+  );
+});
+
+Map.add(legend);
+
+// === 16. VALIDATION SETUP ===
+print('=== VALIDATION RECOMMENDATIONS ===');
+print('1. Collect ground truth data for accuracy assessment');
+print('2. Use stratified random sampling based on confidence levels');
+print('3. Consider temporal validation across multiple seasons');
+print('4. Compare with existing sugarcane maps if available');
+print('5. Validate edge detection and field boundary accuracy');
+
+// Create sample points for validation
+var samplePoints = ee.FeatureCollection.randomPoints({
+  region: studyArea,
+  points: 500,
+  seed: 42
+});
+
+var sampleData = combinedResults.sampleRegions({
+  collection: samplePoints,
+  scale: 10,
+  properties: ['system:index'],
+  geometries: true
+});
+
+Export.table.toDrive({
+  collection: sampleData,
+  description: 'sugarcane_validation_sample_points',
+  fileFormat: 'SHP'
+});
+
+// === FINAL EXPORT INFORMATION ===
+print('=== STYLED EXPORT INFORMATION ===');
+print('Created multiple styled visualizations:');
+print('1. sugarcane_styled_gray_background_green_dots - **MAIN EXPORT** (matches your reference image)');
+print('2. sugarcane_styled_dark_gray_background_green_dots - Dark gray background');
+print('3. sugarcane_satellite_background_green_overlay - Satellite image background');
+print('4. sugarcane_white_background_green_dots - White background');
+print('5. sugarcane_confidence_levels_styled - Confidence levels with different green shades');
+print('6. sugarcane_NIR_index_values - Raw NIR index values');
+print('7. sugarcane_all_methods_comparison - All detection methods');
+print('8. sugarcane_detection_statistics.csv - Area statistics');
+print('9. sugarcane_points_shapefile - Vector points');
+print('10. sugarcane_validation_sample_points - Validation sample points');
+print('');
+print('All exports use:');
+print('- 10m resolution');
+print('- GeoTIFF format (except CSV and SHP)');
+print('- Bright green (RGB: 0,255,0) for sugarcane locations');
+print('- Gray/white/satellite backgrounds');
+print('');
+print('=== SCRIPT EXECUTION COMPLETED ===');
+print('Check the Tasks tab for export progress');
+print('Recommended next steps:');
+print('1. Download sugarcane_styled_gray_background_green_dots for your reference image format');
+print('2. Analyze the threshold sensitivity results');
+print('3. Validate using ground truth data');
+print('4. Fine-tune thresholds based on validation results');
+
+// === MODIFIED NDMI EXPORT WITH SATELLITE BACKGROUND ===
+
+// 1. Create the satellite RGB background (8-bit)
+var satelliteBackground = composite.select(['B4', 'B3', 'B2'])
+    .multiply(255).byte()
+    .clip(studyArea);
+
+// 2. Create NDMI visualization as RGB image
+var ndmiVisParams = {
+  min: -1,
+  max: 1,
+  palette: ['brown', 'yellow', 'cyan', 'blue', 'darkblue']
+};
+
+// 3. Create NDMI RGB visualization
+var ndmiRgb = ndmi.visualize(ndmiVisParams);
+
+// 4. Create sugarcane mask (where sugarcane is detected)
+var sugarcaneMask = sugarcanePrimarySmooth.eq(1);
+
+// 5. Method 1: Show NDMI colors only where sugarcane is detected, satellite elsewhere
+var ndmiOverSatellite = satelliteBackground.where(sugarcaneMask, ndmiRgb);
+
+// 6. Method 2: Blend NDMI with satellite background for sugarcane areas
+// This creates a semi-transparent overlay effect
+var ndmiBlended = ee.Image.cat([
+  satelliteBackground.select('vis-red').where(sugarcaneMask, 
+    ndmiRgb.select('vis-red').multiply(0.7).add(satelliteBackground.select('vis-red').multiply(0.3))),
+  satelliteBackground.select('vis-green').where(sugarcaneMask, 
+    ndmiRgb.select('vis-green').multiply(0.7).add(satelliteBackground.select('vis-green').multiply(0.3))),
+  satelliteBackground.select('vis-blue').where(sugarcaneMask, 
+    ndmiRgb.select('vis-blue').multiply(0.7).add(satelliteBackground.select('vis-blue').multiply(0.3)))
+]).rename(['red', 'green', 'blue']);
+
+// 7. Method 3: Enhanced contrast version - Pure NDMI colors over satellite
+var ndmiEnhanced = satelliteBackground.where(sugarcaneMask, ndmiRgb);
+
+// 8. Add to map for preview
+Map.addLayer(ndmiOverSatellite, {}, 'NDMI over Sugarcane (Method 1)', false);
+Map.addLayer(ndmiBlended, {}, 'NDMI Blended with Satellite (Method 2)', false);
+Map.addLayer(ndmiEnhanced, {}, 'NDMI Enhanced over Satellite (Method 3)');
+
+// 9. Export Method 1 - Pure NDMI colors where sugarcane detected
+Export.image.toDrive({
+  image: ndmiOverSatellite,
+  description: 'ndmi_over_sugarcane_satellite_background_method1',
+  scale: 10,
+  region: studyArea,
+  maxPixels: 1e9,
+  fileFormat: 'GeoTIFF'
+});
+
+// 10. Export Method 2 - Blended NDMI with satellite background
+Export.image.toDrive({
+  image: ndmiBlended,
+  description: 'ndmi_blended_with_satellite_background_method2',
+  scale: 10,
+  region: studyArea,
+  maxPixels: 1e9,
+  fileFormat: 'GeoTIFF'
+});
+
+// 11. Export Method 3 - Enhanced contrast version
+Export.image.toDrive({
+  image: ndmiEnhanced,
+  description: 'ndmi_enhanced_over_satellite_method3',
+  scale: 10,
+  region: studyArea,
+  maxPixels: 1e9,
+  fileFormat: 'GeoTIFF'
+});
+
+// 12. Alternative: Create a version with NDMI borders/outlines
+var ndmiOutlines = ndmiRgb.updateMask(sugarcaneMask);
+var ndmiWithOutlines = satelliteBackground.blend(ndmiOutlines);
+
+Export.image.toDrive({
+  image: ndmiWithOutlines,
+  description: 'ndmi_outlined_over_satellite_background',
+  scale: 10,
+  region: studyArea,
+  maxPixels: 1e9,
+  fileFormat: 'GeoTIFF'
+});
+
+// 13. Optional: Export just the NDMI masked to sugarcane areas (no satellite background)
+var ndmiMaskedOnly = ndmiRgb.updateMask(sugarcaneMask);
+
+Export.image.toDrive({
+  image: ndmiMaskedOnly,
+  description: 'ndmi_sugarcane_areas_only',
+  scale: 10,
+  region: studyArea,
+  maxPixels: 1e9,
+  fileFormat: 'GeoTIFF'
+});
+
+print('=== NDMI EXPORT OPTIONS ===');
+print('1. ndmi_over_sugarcane_satellite_background_method1 - Pure NDMI colors where sugarcane detected');
+print('2. ndmi_blended_with_satellite_background_method2 - 70% NDMI + 30% satellite blend');
+print('3. ndmi_enhanced_over_satellite_method3 - High contrast NDMI over satellite');
+print('4. ndmi_outlined_over_satellite_background - NDMI outlines over satellite');
+print('5. ndmi_sugarcane_areas_only - Just NDMI for sugarcane areas (transparent background)');
+print('');
+print('Recommended: Use Method 1 or Method 3 for clearest visualization');
