@@ -1,0 +1,53 @@
+
+// Load Sentinel-2 surface reflectance data
+var sentinel2 = ee.ImageCollection('COPERNICUS/S2_SR')
+  .filterBounds(roi)
+  .filterDate('2022-09-01', '2023-04-30')
+  .select([  // Explicitly select the bands of interest to avoid any extra bands
+    'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', 'B11', 'B12'
+  ])
+  .mean(); // Use the mean reflectance for the given date range
+
+// Define the bands and their corresponding wavelengths in nanometers
+var bands = [
+  {band: 'B2', wavelength: 490},    // Blue
+  {band: 'B3', wavelength: 560},    // Green
+  {band: 'B4', wavelength: 665},    // Red
+  {band: 'B5', wavelength: 705},    // Red Edge 1
+  {band: 'B6', wavelength: 740},    // Red Edge 2
+  {band: 'B7', wavelength: 783},    // Red Edge 3
+  {band: 'B8', wavelength: 842},    // NIR
+  {band: 'B8A', wavelength: 865},   // NIR (narrow)
+  {band: 'B9', wavelength: 945},    // Water Vapour
+  {band: 'B11', wavelength: 1615},  // SWIR 1
+  {band: 'B12', wavelength: 2190}   // SWIR 2
+];
+// Extract reflectance values for each band
+var reflectance = bands.map(function(bandInfo) {
+  return sentinel2.select(bandInfo.band).reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: roi,
+    scale: 10
+  }).get(bandInfo.band);
+});
+
+// Create an array of reflectance values to match with the corresponding wavelengths
+var reflectanceArray = ee.List(reflectance);
+
+// Extract the wavelengths as a list
+var wavelengthList = ee.List(bands.map(function(bandInfo) {
+  return bandInfo.wavelength;
+}));
+
+// Plot reflectance vs wavelength
+var chart = ui.Chart.array.values(reflectanceArray, 0, wavelengthList)
+  .setChartType('LineChart')
+  .setOptions({
+    title: 'Reflectance vs Wavelength (Sentinel-2)',
+    hAxis: {title: 'Wavelength (nm)'},
+    vAxis: {title: 'Reflectance'},
+    lineWidth: 2,
+    pointSize: 5
+  });
+
+print(chart);

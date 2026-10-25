@@ -1,0 +1,5 @@
+earthengine-api>=0.1.323
+geopandas>=0.10.2
+pandas>=1.4.0
+matplotlib>=3.5.0
+openpyxl>=3.0.9 
